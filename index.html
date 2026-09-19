@@ -171,6 +171,11 @@ header h1 {
         <button class="btn btn-danger" id="btnStop" disabled>Stop Recording</button>
         <div style="height: 10px"></div>
         <button class="btn btn-ghost" id="btnDownload" disabled>Download CSV</button>
+        <div style="height: 10px"></div>
+        <h2>SD Sessions (on device)</h2>
+        <button class="btn btn-info" id="btnList" disabled>Refresh Session List</button>
+        <select id="sessSelect" style="width:100%;padding:10px;margin:0 0 8px 0;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;font-family:var(--font-mono);font-size:13px;" disabled></select>
+        <button class="btn btn-ghost" id="btnDl" disabled>Download Session from Device</button>
       </div>
 
       <div class="panel" style="margin-top: 16px">
@@ -178,6 +183,7 @@ header h1 {
         <div class="stat-row"><span>BLE State</span><span id="stBle">--</span></div>
         <div class="stat-row"><span>Recording</span><span id="stRec">--</span></div>
         <div class="stat-row"><span>Samples received</span><span id="stSamples">0</span></div>
+        <div class="stat-row"><span>SD sessions on device</span><span id="stSess">0</span></div>
         <div class="stat-row"><span>Packets received</span><span id="stPackets">0</span></div>
         <div class="stat-row"><span>Packets lost</span><span id="stLost" class="good">0</span></div>
         <div class="stat-row"><span>Packet loss %</span><span id="stLossPct" class="good">0.00</span></div>
@@ -218,11 +224,15 @@ const SERVICE_UUID   = '19b10000-e8f2-537e-4f6c-d104768a1214';
 const IMU_CHAR_UUID  = '19b10001-e8f2-537e-4f6c-d104768a1214';
 const CMD_CHAR_UUID  = '19b10002-e8f2-537e-4f6c-d104768a1214';
 const STATUS_CHAR_UUID = '19b10003-e8f2-537e-4f6c-d104768a1214';
+const FILE_CHAR_UUID   = '19b10004-e8f2-537e-4f6c-d104768a1214';
 
 // Command bytes
 const CMD_START = 0x01;
 const CMD_STOP  = 0x02;
 const CMD_SYNC  = 0x03;
+const CMD_LIST  = 0x04;
+const CMD_DLOAD = 0x05;
+const CMD_DABORT = 0x06;
 
 // IMU scaling (match firmware: accel 4G, gyro 512dps)
 const ACCEL_LSB_PER_G = 32768.0 / 4.0;
@@ -234,6 +244,14 @@ let server = null;
 let imuChar = null;
 let cmdChar = null;
 let statusChar = null;
+let fileChar = null;
+
+// SD session download state
+let sessions = [];
+let dlBuf = '';          // accumulated CSV content
+let dlSessName = '';     // file name to save as
+let dlExpectSize = 0;    // expected size from DFILE_START
+let dlState = 'idle';    // idle | listing | downloading
 
 let connected = false;
 let recording = false;
@@ -285,6 +303,10 @@ function updateUI() {
   document.getElementById('btnStart').disabled = !connected || recording;
   document.getElementById('btnStop').disabled = !connected || !recording;
   document.getElementById('btnDownload').disabled = samplesBuffer.length === 0;
+  document.getElementById('btnList').disabled = !connected;
+  document.getElementById('btnDl').disabled = !connected || sessions.length === 0;
+  document.getElementById('sessSelect').disabled = !connected || sessions.length === 0;
+  document.getElementById('stSess').textContent = sessions.length;
   document.getElementById('stBle').textContent = connected ? 'Connected' : 'Disconnected';
   document.getElementById('stRec').textContent = recording ? 'ON' : 'OFF';
   updateStatusBadge();
@@ -320,9 +342,13 @@ async function connect() {
     imuChar = await svc.getCharacteristic(IMU_CHAR_UUID);
     cmdChar = await svc.getCharacteristic(CMD_CHAR_UUID);
     statusChar = await svc.getCharacteristic(STATUS_CHAR_UUID);
+    fileChar = await svc.getCharacteristic(FILE_CHAR_UUID);
 
     // Subscribe to IMU notifications BEFORE startNotifications
     imuChar.addEventListener('characteristicvaluechanged', onIMUData);
+
+    // Subscribe to file/session notifications (list + download stream)
+    fileChar.addEventListener('characteristicvaluechanged', onFileData);
 
     await imuChar.startNotifications();
     log('IMU notifications enabled', 'ok');
@@ -351,6 +377,10 @@ function onDisconnected() {
   connected = false;
   recording = false;
   lastSeq = -1;
+  fileChar = null;
+  sessions = [];
+  dlState = 'idle';
+  renderSessions();
   updateUI();
 }
 
@@ -545,6 +575,134 @@ function downloadCSV() {
   log(`CSV downloaded: ${src.length} samples`, 'ok');
 }
 
+// ─── SD Session Listing / Download ──────────────────────────────
+function renderSessions() {
+  const sel = document.getElementById('sessSelect');
+  sel.innerHTML = '';
+  for (const s of sessions) {
+    const opt = document.createElement('option');
+    opt.value = s.idx;
+    opt.textContent = `${s.name} (${s.size} bytes)`;
+    sel.appendChild(opt);
+  }
+}
+
+async function listSessions() {
+  if (!cmdChar) { log('Not connected', 'err'); return; }
+  sessions = [];
+  dlState = 'listing';
+  renderSessions();
+  updateUI();
+  log('Requesting session list...');
+  try {
+    await sendCommand(CMD_LIST);
+  } catch (e) {
+    dlState = 'idle';
+    updateUI();
+    log(`List request failed: ${e.message}`, 'err');
+  }
+}
+
+async function downloadSession() {
+  if (!cmdChar) { log('Not connected', 'err'); return; }
+  const sel = document.getElementById('sessSelect');
+  if (sel.selectedIndex < 0) { log('No session selected', 'err'); return; }
+  const idx = Number(sel.value);
+  dlState = 'downloading';
+  dlBuf = '';
+  dlSessName = '';
+  dlExpectSize = 0;
+  updateUI();
+  log(`Requesting download of session ${idx}...`);
+  try {
+    await sendCommand(CMD_DLOAD, [idx]);
+  } catch (e) {
+    dlState = 'idle';
+    updateUI();
+    log(`Download request failed: ${e.message}`, 'err');
+  }
+}
+
+function saveCSV(name, content) {
+  const blob = new Blob(['\ufeff' + content], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name.endsWith('.csv') ? name : name + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  log(`Saved ${a.download} (${content.length} bytes)`, 'ok');
+}
+
+// FILE characteristic stream: session list frames and download chunks.
+// Frames (one per notification): DLIST_START,<count> | FSESS,<idx>,<name>,<size>
+// | DLIST_END | DFILE_START,<idx>,<name>,<size> | D,<chunk> | DFILE_END,<idx>,<chunks>
+// | ABORT,<idx>,<chunks> | ERR,<reason>,<idx>
+function onFileData(event) {
+  const dv = event.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  const text = new TextDecoder().decode(bytes);
+  if (!text) return;
+  const parts = text.split(',');
+  const tag = parts[0];
+
+  if (dlState === 'listing') {
+    if (tag === 'DLIST_START') {
+      sessions = [];
+    } else if (tag === 'FSESS') {
+      sessions.push({ idx: Number(parts[1]), name: parts[2], size: Number(parts[3]) });
+    } else if (tag === 'DLIST_END') {
+      dlState = 'idle';
+      renderSessions();
+      log(`Found ${sessions.length} session(s) on SD`, 'ok');
+      updateUI();
+    }
+    return;
+  }
+
+  if (dlState === 'downloading') {
+    if (tag === 'DFILE_START') {
+      dlBuf = '';
+      dlSessName = parts[2];
+      dlExpectSize = Number(parts[3]);
+      log(`Downloading ${dlSessName} (${dlExpectSize} bytes)...`);
+    } else if (tag === 'D') {
+      if (parts.length > 1) dlBuf += parts.slice(1).join(',');
+    } else if (tag === 'DFILE_END') {
+      const idx = Number(parts[1]);
+      const chunks = Number(parts[2]);
+      if (dlExpectSize === 0 || dlBuf.length === dlExpectSize) {
+        saveCSV(dlSessName, dlBuf);
+        log(`Session ${idx} complete (${chunks} chunks, ${dlBuf.length} bytes)`, 'ok');
+      } else {
+        log(`INCOMPLETE: got ${dlBuf.length} of ${dlExpectSize} bytes (${chunks} chunks)`, 'err');
+      }
+      dlState = 'idle';
+      dlBuf = '';
+      dlSessName = '';
+      dlExpectSize = 0;
+      updateUI();
+    } else if (tag === 'ABORT') {
+      dlState = 'idle';
+      dlBuf = '';
+      dlSessName = '';
+      dlExpectSize = 0;
+      log(`Download aborted by device after ${parts[2]} chunks`, 'err');
+      updateUI();
+    } else if (tag === 'ERR') {
+      dlState = 'idle';
+      dlBuf = '';
+      dlSessName = '';
+      dlExpectSize = 0;
+      log(`Download error: ${parts.slice(1).join(',')}`, 'err');
+      updateUI();
+    }
+    return;
+  }
+}
+
 // ─── Sparkline Drawing ───────────────────────────────────────────
 function drawSparkline() {
   const canvas = document.getElementById('sparkline');
@@ -612,6 +770,8 @@ document.getElementById('btnRefresh').addEventListener('click', async () => {
 document.getElementById('btnStart').addEventListener('click', startRecording);
 document.getElementById('btnStop').addEventListener('click', stopRecording);
 document.getElementById('btnDownload').addEventListener('click', downloadCSV);
+document.getElementById('btnList').addEventListener('click', listSessions);
+document.getElementById('btnDl').addEventListener('click', downloadSession);
 
 updateUI();
 log('Ready. Click Connect to pair with the ESP32-S3 (http://localhost or HTTPS required).');
