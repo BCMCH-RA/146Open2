@@ -922,19 +922,33 @@ static void displayTask(void *pvParameters) {
 
         TremorLevel_t lvl;
         float rms = 0.0f;
+        float narrow = 1.0f;
         if (Tremor_Metric_Get(&lvl, &rms)) {
             tremorRms = rms;
             strlcpy(dispSev, Tremor_Level_Text(lvl), sizeof(dispSev));
             dispSevColor = Tremor_Level_Color(lvl);
         }
+        // Separate call on purpose: Tremor_Metric_Get and
+        // Tremor_Metric_GetNarrowband each track their own sample stamp, so
+        // asking for both does not make either of them report stale data.
+        Tremor_Metric_GetNarrowband(&narrow);
 
         // 1 Hz trace of the measured severity. The on-screen "RMS: x.x dps"
         // only shows one decimal of a smoothed value; this is what to watch
         // when re-deriving the band edges against real subjects, since it
         // shows the actual number driving the CALM/MILD/MODERATE/SEVERE call.
+        //
+        // nb is the narrowband ratio and the flag is the movement gate
+        // suppressing escalation. Logging both is what lets TREMOR_NARROWBAND_MIN
+        // be re-derived from real walks instead of guessed: sit still, then
+        // deliberately swing the arm, then hold a tremor, and compare. Real
+        // tremor has been measured at 0.86-0.94 and a large arm swing at
+        // 0.19-0.34, so the floor sits between them with room on both sides.
         if (now - lastTremorTrace >= 1000) {
             lastTremorTrace = now;
-            printf("TREMOR %.2f dps %s\r\n", tremorRms, dispSev);
+            printf("TREMOR %.2f dps %s nb=%.2f%s\r\n",
+                   tremorRms, dispSev, narrow,
+                   narrow < TREMOR_NARROWBAND_MIN ? " (movement)" : "");
         }
 
         // BAT_Get_Volts() goes through the ADC calibration path, so keep it at
