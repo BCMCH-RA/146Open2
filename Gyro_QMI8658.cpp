@@ -17,10 +17,18 @@ uint32_t reading_timestamp_us;
 
 void QMI8658_Init(void)
 {
-    uint8_t buf[1];
+    uint8_t buf[1] = {0};
     Device_addr = QMI8658_L_SLAVE_ADDRESS;
-    I2C_Read(Device_addr, QMI8658_REVISION_ID, buf, 1);
-    printf("QMI8658 ID: %x\r\n", buf[0]);
+    esp_err_t idErr = I2C_Read(Device_addr, QMI8658_REVISION_ID, buf, 1);
+    if (idErr == ESP_OK) {
+        printf("QMI8658 ID: %x\r\n", buf[0]);
+        if (buf[0] != QMI8658_REVISION_ID_VALUE) {
+            printf("QMI8658 unexpected revision 0x%02X (want 0x%02X)\r\n",
+                   buf[0], (unsigned)QMI8658_REVISION_ID_VALUE);
+        }
+    } else {
+        printf("QMI8658 probe failed err=%d addr 0x%02X\r\n", (int)idErr, Device_addr);
+    }
     setState(sensor_running);
 
     setAccScale(acc_scale);
@@ -182,7 +190,7 @@ static bool    s_haveImu    = false;
 void QMI8658_BurstRead(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz)
 {
     uint8_t buf[12] = {0};
-    if (!I2C_Read(Device_addr, QMI8658_AX_L, buf, 12) || !s_haveImu) {
+    if (I2C_Read(Device_addr, QMI8658_AX_L, buf, 12) != 0) {
         if (s_haveImu) {
             *ax = s_lastImu[0]; *ay = s_lastImu[1]; *az = s_lastImu[2];
             *gx = s_lastImu[3]; *gy = s_lastImu[4]; *gz = s_lastImu[5];

@@ -9,9 +9,11 @@ uint8_t I2C_Read_EXIO(uint8_t REG)
     printf("TCA9554 Read fail\r\n");
   }
   Wire.requestFrom(TCA9554_ADDRESS, 1);
-  uint8_t bitsStatus;
+  uint8_t bitsStatus = 0xFF;
   if (Wire.available()) {
     bitsStatus = Wire.read();
+  } else {
+    printf("TCA9554 no data\r\n");
   }
   return bitsStatus;
 }
